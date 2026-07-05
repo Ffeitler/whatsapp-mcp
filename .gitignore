@@ -1,3 +1,21 @@
+# --- databases & WhatsApp message store (private data, regenerated at runtime) ---
 *.db
+store/
+
+# --- secrets (read from file at runtime, never committed) ---
+.seatgeek_client_id
+.ticketmaster_api_key
 claude_desktop_config.json
+
+# --- compiled Go binary (rebuilt from whatsapp-bridge 2/main.go) ---
+whatsapp-bridge/whatsapp-bridge
+whatsapp-bridge/whatsapp-bridge.bak-*
+whatsapp-bridge 2/whatsapp-bridge
+whatsapp-bridge 2/whatsapp-bridge.new
+
+# --- logs ---
+*.log
 whatsapp.log
+
+# --- macOS cruft ---
+.DS_Store
