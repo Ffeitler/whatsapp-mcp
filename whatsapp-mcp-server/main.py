@@ -246,6 +246,60 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "message": "Failed to download media"
         }
 
+# 2026-08-02: Google Maps directions, added here (not a new MCP server) to reuse
+# this already-configured stdio server rather than stand up a second one just
+# for one read-only tool. Key from GOOGLE_MAPS_API_KEY, inherited from whatever
+# launched the parent `claude` process (wa-bot.sh sources config/secondbrain.local.env
+# via lib/common.sh before invoking claude — see secondbrain-automation repo).
+@mcp.tool()
+def get_directions(origin: str, destination: str) -> Dict[str, Any]:
+    """Get real driving directions (live distance, duration, and route summary) between two places via the Google Maps Directions API.
+
+    Args:
+        origin: Starting point — an address, place name, or "lat,lng"
+        destination: Destination — an address, place name, or "lat,lng"
+
+    Returns:
+        A dictionary with success status, and on success: distance, duration,
+        resolved start/end addresses, and a short list of major route steps
+        (street names only, not full turn-by-turn — keep replies concise).
+    """
+    import os
+    import urllib.parse
+    import urllib.request
+    import json as _json
+    import re
+
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        return {"success": False, "message": "GOOGLE_MAPS_API_KEY not set in environment"}
+
+    params = urllib.parse.urlencode({"origin": origin, "destination": destination, "key": api_key})
+    url = f"https://maps.googleapis.com/maps/api/directions/json?{params}"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = _json.loads(resp.read())
+    except Exception as e:
+        return {"success": False, "message": f"Directions API request failed: {e}"}
+
+    status = data.get("status")
+    if status != "OK":
+        return {"success": False, "message": f"Directions API status={status}: {data.get('error_message', '')}"}
+
+    route = data["routes"][0]
+    leg = route["legs"][0]
+    # Strip HTML tags from step instructions (API returns e.g. "Head <b>north</b>").
+    steps = [re.sub("<[^<]+?>", "", s["html_instructions"]) for s in leg["steps"]]
+
+    return {
+        "success": True,
+        "distance": leg["distance"]["text"],
+        "duration": leg["duration"]["text"],
+        "start_address": leg["start_address"],
+        "end_address": leg["end_address"],
+        "major_steps": steps[:6],
+    }
+
 if __name__ == "__main__":
     # Initialize and run the server
     mcp.run(transport='stdio')
