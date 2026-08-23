@@ -13,6 +13,9 @@ whatsapp-bridge/whatsapp-bridge.bak-*
 whatsapp-bridge 2/whatsapp-bridge
 whatsapp-bridge 2/whatsapp-bridge.new
 
+# --- compiled Go binary (rebuilt from claudia-bridge/main.go) ---
+claudia-bridge/claudia-bridge
+
 # --- logs ---
 *.log
 whatsapp.log
