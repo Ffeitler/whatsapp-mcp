@@ -622,9 +622,21 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         if 'conn' in locals():
             conn.close()
 
+def _normalize_recipient(recipient: str) -> str:
+    """Bridge requires digits only for phone recipients. A literal "+" (or
+    spaces/dashes) makes whatsmeow build JID "+1305...@s.whatsapp.net", miss
+    the local LID map, and fall back to a usync query that times out
+    ("failed to get user info ... info query timed out") — 163 such failures
+    in bridge.log through 2026-09-20, every one "+"-prefixed. JIDs pass through."""
+    recipient = (recipient or "").strip()
+    if "@" in recipient:
+        return recipient
+    return "".join(ch for ch in recipient if ch.isdigit())
+
 def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     try:
         # Validate input
+        recipient = _normalize_recipient(recipient)
         if not recipient:
             return False, "Recipient must be provided"
         
@@ -653,9 +665,10 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input
+        recipient = _normalize_recipient(recipient)
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
         
@@ -687,9 +700,10 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input
+        recipient = _normalize_recipient(recipient)
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
         
