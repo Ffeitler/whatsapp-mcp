@@ -300,6 +300,84 @@ def get_directions(origin: str, destination: str) -> Dict[str, Any]:
         "major_steps": steps[:6],
     }
 
+# Ride links — Uber has no consumer ride-request API (the Rides API "request"
+# scope was closed to new apps), so "get me an uber" ends in a one-tap deep link
+# that opens the Uber app with the dropoff filled in and pickup = the phone's own
+# GPS; Fabio taps Request himself. The link is built here, not by the model, so
+# coordinates and URL-encoding are never hand-typed.
+@mcp.tool()
+def get_ride_link(destination: str, origin: str = "") -> Dict[str, Any]:
+    """Build one-tap Uber (and Lyft) links that open the app with the destination pre-filled.
+
+    Pickup is always the phone's current GPS location (set in the app), so this never
+    guesses where Fabio is standing. Nothing is booked — he confirms in the app.
+
+    Args:
+        destination: Where to go — an address, place name, or "lat,lng"
+        origin: Optional best-known current location, used only to estimate trip
+            distance/duration (driving). Leave empty if unknown.
+
+    Returns:
+        success, uber_link, lyft_link, resolved destination address + lat/lng, and
+        (when origin was given) the driving distance/duration estimate.
+    """
+    import os
+    import urllib.parse
+    import urllib.request
+    import json as _json
+
+    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+    if not api_key:
+        return {"success": False, "message": "GOOGLE_MAPS_API_KEY not set in environment"}
+
+    def _get(url: str) -> Dict[str, Any]:
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            return _json.loads(resp.read())
+
+    trip: Dict[str, Any] = {}
+    try:
+        if origin:
+            params = urllib.parse.urlencode({"origin": origin, "destination": destination, "key": api_key})
+            data = _get(f"https://maps.googleapis.com/maps/api/directions/json?{params}")
+            if data.get("status") != "OK":
+                return {"success": False, "message": f"Directions API status={data.get('status')}: {data.get('error_message', '')}"}
+            leg = data["routes"][0]["legs"][0]
+            loc, address = leg["end_location"], leg["end_address"]
+            trip = {"distance": leg["distance"]["text"], "duration": leg["duration"]["text"]}
+        else:
+            params = urllib.parse.urlencode({"address": destination, "key": api_key})
+            data = _get(f"https://maps.googleapis.com/maps/api/geocode/json?{params}")
+            if data.get("status") != "OK":
+                return {"success": False, "message": f"Geocoding API status={data.get('status')}: {data.get('error_message', '')}"}
+            result = data["results"][0]
+            loc, address = result["geometry"]["location"], result["formatted_address"]
+    except Exception as e:
+        return {"success": False, "message": f"Maps API request failed: {e}"}
+
+    lat, lng = loc["lat"], loc["lng"]
+    uber = "https://m.uber.com/ul/?" + urllib.parse.urlencode({
+        "action": "setPickup",
+        "pickup": "my_location",
+        "dropoff[latitude]": lat,
+        "dropoff[longitude]": lng,
+        "dropoff[nickname]": destination,
+        "dropoff[formatted_address]": address,
+    })
+    lyft = "https://lyft.com/ride?" + urllib.parse.urlencode({
+        "id": "lyft",
+        "destination[latitude]": lat,
+        "destination[longitude]": lng,
+    })
+    return {
+        "success": True,
+        "uber_link": uber,
+        "lyft_link": lyft,
+        "destination_address": address,
+        "destination_lat": lat,
+        "destination_lng": lng,
+        **trip,
+    }
+
 if __name__ == "__main__":
     # Initialize and run the server
     mcp.run(transport='stdio')
