@@ -1,6 +1,11 @@
 # --- databases & WhatsApp message store (private data, regenerated at runtime) ---
 *.db
 store/
+# store is a SYMLINK since 2026-09-26 (bridge moved to ~/.claude/whatsapp-bridge);
+# a trailing-slash pattern only matches real directories, so name it too.
+whatsapp-bridge/store
+# pre-relocation rollback copy of the whole store (media + session DB)
+whatsapp-bridge/store.pre-relocate-*/
 
 # --- secrets (read from file at runtime, never committed) ---
 .seatgeek_client_id
