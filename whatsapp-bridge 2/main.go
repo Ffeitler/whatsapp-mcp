@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
@@ -185,8 +186,39 @@ func extractTextContent(msg *waProto.Message) string {
 		return extendedText.GetText()
 	}
 
-	// For now, we're ignoring non-text messages
+	// Location pins. Upstream dropped these (no text, no media), so a pin sent
+	// to the self-chat never reached wa-bot. Stored as text with a fixed
+	// "[location] lat,lng" prefix that wa-bot parses; name/address/caption
+	// follow after " | " when WhatsApp supplies them. A live-location share
+	// arrives as its first fix only — WhatsApp does not relay live updates to
+	// linked devices.
+	if loc := msg.GetLocationMessage(); loc != nil {
+		return formatLocation("", loc.GetDegreesLatitude(), loc.GetDegreesLongitude(),
+			loc.GetName(), loc.GetAddress(), loc.GetComment())
+	}
+	if live := msg.GetLiveLocationMessage(); live != nil {
+		return formatLocation("live", live.GetDegreesLatitude(), live.GetDegreesLongitude(),
+			"", "", live.GetCaption())
+	}
+
 	return ""
+}
+
+func formatLocation(kind string, lat, lng float64, parts ...string) string {
+	if lat == 0 && lng == 0 {
+		return ""
+	}
+	out := "[location] "
+	if kind != "" {
+		out = "[location " + kind + "] "
+	}
+	out += fmt.Sprintf("%.6f,%.6f", lat, lng)
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out += " | " + p
+		}
+	}
+	return out
 }
 
 // SendMessageResponse represents the response for the send message API
@@ -212,6 +244,25 @@ type ReactRequest struct {
 }
 
 // Function to send a WhatsApp message
+// documentMimeTypes pins the types that matter for phone delivery rather than
+// trusting mime.TypeByExtension, whose answer depends on the host's type tables.
+var documentMimeTypes = map[string]string{
+	"pdf":  "application/pdf",
+	"html": "text/html",
+	"htm":  "text/html",
+	"txt":  "text/plain",
+	"md":   "text/markdown",
+	"csv":  "text/csv",
+	"json": "application/json",
+	"zip":  "application/zip",
+	"doc":  "application/msword",
+	"docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	"xls":  "application/vnd.ms-excel",
+	"xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	"ppt":  "application/vnd.ms-powerpoint",
+	"pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
@@ -288,7 +339,17 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Document types (for any other file type)
 		default:
 			mediaType = whatsmeow.MediaDocument
-			mimeType = "application/octet-stream"
+			// Upstream sent every document as application/octet-stream with no
+			// FileName, so the phone got an untyped, extension-less blob that no
+			// app would open (HTML and PDF reports both failed, 2026-09-26).
+			// Type it from the extension; octet-stream stays the last resort.
+			mimeType = documentMimeTypes[fileExt]
+			if mimeType == "" {
+				mimeType = mime.TypeByExtension("." + fileExt)
+			}
+			if mimeType == "" {
+				mimeType = "application/octet-stream"
+			}
 		}
 
 		// Upload media to WhatsApp servers
@@ -355,7 +416,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(filepath.Base(mediaPath)),
+				FileName:      proto.String(filepath.Base(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -1123,14 +1185,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				}
 
 				// Extract text content
-				var content string
-				if msg.Message.Message != nil {
-					if conv := msg.Message.Message.GetConversation(); conv != "" {
-						content = conv
-					} else if ext := msg.Message.Message.GetExtendedTextMessage(); ext != nil {
-						content = ext.GetText()
-					}
-				}
+				content := extractTextContent(msg.Message.Message)
 
 				// Extract media info
 				var mediaType, filename, url string
