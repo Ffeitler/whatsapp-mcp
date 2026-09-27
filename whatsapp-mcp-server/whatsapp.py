@@ -3,6 +3,8 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import os.path
+import shutil
+import time
 import requests
 import json
 import audio
@@ -662,6 +664,32 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+
+# The bridge reads media files itself, and since 2026-09-26 it runs from
+# ~/.claude/whatsapp-bridge under launchd as a non-Apple binary. macOS gates
+# ~/Desktop for such processes, so a Desktop path (the vault — "send me my
+# passport" — or a Personal-Reports- PDF) would hang the bridge's read
+# silently. This process (whoever spawned it) does the Desktop read instead:
+# copy the file to a staging dir beside the bridge, hand over that copy, and
+# delete it once the send returns. Paths outside Desktop pass through as-is.
+_DESKTOP = os.path.join(os.path.expanduser("~"), "Desktop") + os.sep
+_STAGING = os.path.join(os.path.expanduser("~"), ".claude", "whatsapp-bridge", "outgoing")
+_SEND_TIMEOUT_S = 120
+
+
+def _stage_for_bridge(media_path: str) -> Tuple[str, bool]:
+    """Return (path the bridge should read, whether it is a staged copy)."""
+    if not os.path.realpath(media_path).startswith(_DESKTOP) and not media_path.startswith(_DESKTOP):
+        return media_path, False
+    # One subdirectory per send, so the copy keeps its real name: the bridge
+    # sends the basename as the document's file name, and a timestamp prefix
+    # there is what the recipient saw (2026-09-27, "the name is weird").
+    folder = os.path.join(_STAGING, str(int(time.time() * 1000)))
+    os.makedirs(folder, exist_ok=True)
+    staged = os.path.join(folder, os.path.basename(media_path))
+    shutil.copyfile(media_path, staged)
+    return staged, True
+
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
         # Validate input
@@ -676,12 +704,21 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             return False, f"Media file not found: {media_path}"
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
+        bridge_path, staged = _stage_for_bridge(media_path)
         payload = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": bridge_path
         }
         
-        response = requests.post(url, json=payload)
+        try:
+            response = requests.post(url, json=payload, timeout=_SEND_TIMEOUT_S)
+        finally:
+            if staged:
+                try:
+                    os.remove(bridge_path)
+                    os.rmdir(os.path.dirname(bridge_path))
+                except OSError:
+                    pass
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -717,12 +754,21 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
         
         url = f"{WHATSAPP_API_BASE_URL}/send"
+        bridge_path, staged = _stage_for_bridge(media_path)
         payload = {
             "recipient": recipient,
-            "media_path": media_path
+            "media_path": bridge_path
         }
         
-        response = requests.post(url, json=payload)
+        try:
+            response = requests.post(url, json=payload, timeout=_SEND_TIMEOUT_S)
+        finally:
+            if staged:
+                try:
+                    os.remove(bridge_path)
+                    os.rmdir(os.path.dirname(bridge_path))
+                except OSError:
+                    pass
         
         # Check if the request was successful
         if response.status_code == 200:
