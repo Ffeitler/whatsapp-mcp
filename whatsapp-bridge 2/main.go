@@ -761,10 +761,14 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep the query string. It carries WhatsApp's signed access tokens
+	// (oh=, oe=) and whatsmeow builds the download URL as
+	// https://<media host><directPath>&hash=...&mms-type=... — so the path
+	// must already contain "?...". Since the 2026-09 whatsmeow bump,
+	// Download() ignores GetURL() and only uses the direct path; stripping
+	// the query here produced a bare path the CDN rejected with 403
+	// (every image/document download failed 2026-09-29 → 2026-10-01).
+	// A real WhatsApp DirectPath is exactly this: URL path + query, no host.
 	return "/" + pathPart
 }
 
