@@ -91,6 +91,22 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Additive migrations for stores created before these columns existed.
+	// quoted_id / quoted_content record WhatsApp's native reply ("swipe to
+	// reply") context — the id of the message being replied to and a short
+	// description of it — so a downstream reader (wa-bot) knows what "this"
+	// refers to. SQLite has no ADD COLUMN IF NOT EXISTS, so a "duplicate
+	// column" error is the expected steady state and is ignored.
+	for _, stmt := range []string{
+		"ALTER TABLE messages ADD COLUMN quoted_id TEXT",
+		"ALTER TABLE messages ADD COLUMN quoted_content TEXT",
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -110,7 +126,8 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64,
+	quotedID, quotedContent string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -118,11 +135,27 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages 
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, quoted_id, quoted_content) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, quotedID, quotedContent,
 	)
 	return err
+}
+
+// Look up a previously stored message so a quote whose embedded copy is
+// missing or trimmed can still be described from our own record of it.
+func (store *MessageStore) describeStoredMessage(id string) string {
+	var content, mediaType, filename string
+	err := store.db.QueryRow(
+		"SELECT content, COALESCE(media_type, ''), COALESCE(filename, '') FROM messages WHERE id = ? LIMIT 1", id,
+	).Scan(&content, &mediaType, &filename)
+	if err != nil {
+		return ""
+	}
+	if mediaType != "" {
+		return strings.TrimSpace(fmt.Sprintf("[%s: %s] %s", mediaType, filename, content))
+	}
+	return content
 }
 
 // Get messages from a chat
@@ -174,6 +207,85 @@ func (store *MessageStore) GetChats() (map[string]time.Time, error) {
 }
 
 // Extract text content from a message
+// quotedContextInfo returns the ContextInfo of whichever message kind carries
+// one. A reply ("swipe to reply") to any message arrives as an
+// ExtendedTextMessage even when the user typed plain text, and media sent as a
+// reply carries the same ContextInfo on the media message itself.
+func quotedContextInfo(msg *waProto.Message) *waProto.ContextInfo {
+	if msg == nil {
+		return nil
+	}
+	switch {
+	case msg.GetExtendedTextMessage() != nil:
+		return msg.GetExtendedTextMessage().GetContextInfo()
+	case msg.GetImageMessage() != nil:
+		return msg.GetImageMessage().GetContextInfo()
+	case msg.GetVideoMessage() != nil:
+		return msg.GetVideoMessage().GetContextInfo()
+	case msg.GetAudioMessage() != nil:
+		return msg.GetAudioMessage().GetContextInfo()
+	case msg.GetDocumentMessage() != nil:
+		return msg.GetDocumentMessage().GetContextInfo()
+	case msg.GetStickerMessage() != nil:
+		return msg.GetStickerMessage().GetContextInfo()
+	case msg.GetLocationMessage() != nil:
+		return msg.GetLocationMessage().GetContextInfo()
+	case msg.GetLiveLocationMessage() != nil:
+		return msg.GetLiveLocationMessage().GetContextInfo()
+	}
+	return nil
+}
+
+// describeQuotedMessage renders the quoted message WhatsApp embeds in a reply
+// as one line: plain text for a text quote, "[TYPE: filename] caption" for a
+// media quote (the "[" prefix is what tells wa-bot the quote was media and the
+// real file may need fetching by quoted_id).
+func describeQuotedMessage(q *waProto.Message) string {
+	if q == nil {
+		return ""
+	}
+	if text := extractTextContent(q); text != "" {
+		return text
+	}
+	switch {
+	case q.GetImageMessage() != nil:
+		return strings.TrimSpace("[image: ] " + q.GetImageMessage().GetCaption())
+	case q.GetVideoMessage() != nil:
+		return strings.TrimSpace("[video: ] " + q.GetVideoMessage().GetCaption())
+	case q.GetAudioMessage() != nil:
+		return "[audio: ]"
+	case q.GetDocumentMessage() != nil:
+		d := q.GetDocumentMessage()
+		return strings.TrimSpace(fmt.Sprintf("[document: %s] %s", d.GetFileName(), d.GetCaption()))
+	case q.GetStickerMessage() != nil:
+		return "[sticker: ]"
+	}
+	return ""
+}
+
+// extractQuoted returns the id and a description of the message this one
+// replies to, or empty strings when it is not a reply. The embedded copy of
+// the quoted message is preferred; if WhatsApp omitted or trimmed it, our own
+// stored row for that id is used instead.
+func extractQuoted(store *MessageStore, msg *waProto.Message) (string, string) {
+	ci := quotedContextInfo(msg)
+	if ci == nil {
+		return "", ""
+	}
+	quotedID := ci.GetStanzaID()
+	if quotedID == "" {
+		return "", ""
+	}
+	desc := describeQuotedMessage(ci.GetQuotedMessage())
+	if desc == "" && store != nil {
+		desc = store.describeStoredMessage(quotedID)
+	}
+	if desc == "" {
+		desc = "[message]"
+	}
+	return quotedID, desc
+}
+
 func extractTextContent(msg *waProto.Message) string {
 	if msg == nil {
 		return ""
@@ -527,6 +639,9 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		return
 	}
 
+	// Reply context (what this message was swiped-to-reply on), if any
+	quotedID, quotedContent := extractQuoted(messageStore, msg.Message)
+
 	// Store message in database
 	err = messageStore.StoreMessage(
 		msg.Info.ID,
@@ -542,6 +657,8 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileSHA256,
 		fileEncSHA256,
 		fileLength,
+		quotedID,
+		quotedContent,
 	)
 
 	if err != nil {
@@ -1240,6 +1357,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					continue
 				}
 
+				quotedID, quotedContent := extractQuoted(messageStore, msg.Message.Message)
+
 				err = messageStore.StoreMessage(
 					msgID,
 					chatJID,
@@ -1254,6 +1373,8 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileSHA256,
 					fileEncSHA256,
 					fileLength,
+					quotedID,
+					quotedContent,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
